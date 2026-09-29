@@ -1,0 +1,396 @@
+// ==UserScript==
+// @name         YouTube 4‑Block WebGL Scrambler
+// @namespace    http://tampermonkey.net/
+// @version      0.1
+// @description  Auto‑activate a 4‑quadrant WebGL
+// @author       Adapted by Kal
+// @grant        none
+// @run-at       document-idle
+//==/UserScript==
+
+(function () {
+    'use strict';
+
+    /* --------------------------- CONFIG --------------------------- */
+    // Destination quadrant index → source quadrant index (TL,TR,BL,BR)
+    const MAPPING = [2, 0, 3, 1];
+    // Transformation (mirror / rotate‑180) for each source block
+    const TRANSFORMS = ['mirror', 'rotate180', 'rotate180', 'mirror'];
+    // NDC positions for the four destination quads (each quad = 2 triangles)
+    const NDC_POSITIONS = [
+        // DEST 0 – Top‑Left
+        -1,  1, -1, 0,  0, 1,
+         0,  1,  0, 0, -1, 0,
+        // DEST 1 – Top‑Right
+         0,  1,  0, 0,  1, 1,
+         1,  1,  1, 0,  0, 0,
+        // DEST 2 – Bottom‑Left
+        -1,  0,  0, 0, -1,-1,
+         0,  0,  0,-1, -1,-1,
+        // DEST 3 – Bottom‑Right
+         0,  0,  1, 0,  0,-1,
+         1,  0,  1,-1,  0,-1
+    ];
+
+    /* -------------------------- STATE --------------------------- */
+    let video            = null;   // <video> element
+    let videoContainer   = null;   // .html5‑video‑container or parent
+    let canvas           = null;   // Overlay canvas
+    let gl               = null;   // WebGL context
+    let program          = null;   // GLSL program
+    let positionBuffer   = null;   // NDC vertex buffer
+    let texCoordBuffer   = null;   // UV coordinate buffer
+    let videoTexture     = null;   // GL texture that receives video frames
+    let textureLocation  = null;   // Uniform location for the texture
+    let resizeObs        = null;   // ResizeObserver instance
+    let rafId            = null;   // ID of fallback requestAnimationFrame loop
+
+    /* -------------------------- SHADERS -------------------------- */
+    const VS_SOURCE = `
+        attribute vec2 a_position;
+        attribute vec2 a_texCoord;
+        varying vec2 v_texCoord;
+        void main() {
+            gl_Position = vec4(a_position, 0.0, 1.0);
+            v_texCoord  = a_texCoord;
+        }
+    `;
+
+    const FS_SOURCE = `
+        precision mediump float;
+        uniform sampler2D u_videoTexture;
+        varying vec2 v_texCoord;
+        void main() {
+            gl_FragColor = texture2D(u_videoTexture, v_texCoord);
+        }
+    `;
+
+    /* ---------------------- CLEAN‑UP FUNCTION ---------------------- */
+    function cleanup() {
+        stopScrambling();                // stop any running draw loop
+        if (resizeObs) {
+            resizeObs.disconnect();
+            resizeObs = null;
+        }
+        if (canvas && canvas.parentElement) {
+            canvas.parentElement.removeChild(canvas);
+        }
+        // Delete GL objects (best‑practice)
+        if (gl) {
+            if (program)   gl.deleteProgram(program);
+            if (positionBuffer) gl.deleteBuffer(positionBuffer);
+            if (texCoordBuffer) gl.deleteBuffer(texCoordBuffer);
+            if (videoTexture)   gl.deleteTexture(videoTexture);
+        }
+        // Reset global references
+        video = videoContainer = canvas = gl = program = null;
+        video.style?.opacity = '1';
+    }
+
+    /* ---------------------- INITIALISATION ---------------------- */
+    function init() {
+        // 1️⃣  Locate the <video> element
+        video = document.getElementById('movie_player') ||
+                document.querySelector('video.html5-main-video') ||
+                document.querySelector('video.video-stream') ||
+                document.querySelector('video');
+        if (!video) {
+            // Could still be loading – try again shortly
+            setTimeout(init, 500);
+            return;
+        }
+
+        // 2️⃣  Make sure the video has enough metadata (dimensions, etc.)
+        if (video.readyState < 3) { // HAVE_CURRENT_DATA
+            video.addEventListener('canplay', () => init(), { once: true });
+            return;
+        }
+        if (video.videoWidth === 0 || video.videoHeight === 0) {
+            video.addEventListener('loadedmetadata', () => init(), { once: true });
+            return;
+        }
+
+        // 3️⃣  Determine the container that should hold the canvas
+        videoContainer = video.closest('.html5-video-container') || video.parentElement;
+        if (!videoContainer) {
+            console.error('Unable to locate video container – aborting.');
+            return;
+        }
+
+        // 4️⃣  Create the overlay canvas
+        createCanvas();
+
+        // 5️⃣  Set up the WebGL drawing pipeline
+        if (!initWebGL()) {
+            console.error('WebGL init failed – scrambler disabled.');
+            cleanup();
+            return;
+        }
+
+        // 6️⃣  React to layout changes (theater mode, fullscreen, window resize,…)
+        setupObservers(videoContainer);
+
+        // 7️⃣  Finally, start the scramble automatically
+        activateScrambler();
+    }
+
+    /* ------------------------ CANVAS -------------------------- */
+    function createCanvas() {
+        canvas = document.createElement('canvas');
+        Object.assign(canvas.style, {
+            position: 'absolute',
+            top: 0,
+            left: 0,
+            width:  '100%',
+            height: '100%',
+            pointerEvents: 'none',
+            zIndex: 20,
+            display: 'none'
+        });
+        // Ensure the container can host an absolutely positioned child
+        const containerStyle = getComputedStyle(videoContainer);
+        if (containerStyle.position === 'static') videoContainer.style.position = 'relative';
+        videoContainer.appendChild(canvas);
+    }
+
+    /* ------------------------ RESIZING ------------------------ */
+    function resizeCanvas() {
+        if (!video || !canvas || !videoContainer || !gl) return;
+
+        // 1️⃣  Sync the actual pixel buffer with the video size
+        const pixW = video.videoWidth;
+        const pixH = video.videoHeight;
+        if (canvas.width !== pixW || canvas.height !== pixH) {
+            canvas.width  = pixW;
+            canvas.height = pixH;
+            gl.viewport(0, 0, pixW, pixH);
+        }
+
+        // 2️⃣  Sync the CSS size & position so the overlay stays over the player
+        const videoRect    = video.getBoundingClientRect();
+        const containerRect = videoContainer.getBoundingClientRect();
+        canvas.style.width  = videoRect.width  + 'px';
+        canvas.style.height = videoRect.height + 'px';
+        canvas.style.left   = (videoRect.left - containerRect.left) + 'px';
+        canvas.style.top    = (videoRect.top  - containerRect.top ) + 'px';
+    }
+
+    /* ------------------------ WEbGL SETUP --------------------- */
+    function initWebGL() {
+        gl = canvas.getContext('webgl');
+        if (!gl) return false;
+
+        // ----- Compile shaders -------------------------------------------------
+        const vs = gl.createShader(gl.VERTEX_SHADER);
+        gl.shaderSource(vs, VS_SOURCE);
+        gl.compileShader(vs);
+        if (!gl.getShaderParameter(vs, gl.COMPILE_STATUS)) {
+            console.error('Vertex shader compile error:', gl.getShaderInfoLog(vs));
+            return false;
+        }
+
+        const fs = gl.createShader(gl.FRAGMENT_SHADER);
+        gl.shaderSource(fs, FS_SOURCE);
+        gl.compileShader(fs);
+        if (!gl.getShaderParameter(fs, gl.COMPILE_STATUS)) {
+            console.error('Fragment shader compile error:', gl.getShaderInfoLog(fs));
+            return false;
+        }
+
+        // ----- Link program ----------------------------------------------------
+        program = gl.createProgram();
+        gl.attachShader(program, vs);
+        gl.attachShader(program, fs);
+        gl.linkProgram(program);
+        if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+            console.error('Program link error:', gl.getProgramInfoLog(program));
+            return false;
+        }
+        gl.useProgram(program);
+
+        // ----- Vertex buffers ----------------------------------------------------
+        positionBuffer = gl.createBuffer();
+        gl.bindBuffer(gl.ARRAY_BUFFER, positionBuffer);
+        gl.bufferData(gl.ARRAY_BUFFER,
+                      new Float32Array(NDC_POSITIONS),
+                      gl.STATIC_DRAW);
+
+        const uvArray = generateTexCoords();   // 48 floats
+        texCoordBuffer = gl.createBuffer();
+        gl.bindBuffer(gl.ARRAY_BUFFER, texCoordBuffer);
+        gl.bufferData(gl.ARRAY_BUFFER,
+                      new Float32Array(uvArray),
+                      gl.STATIC_DRAW);
+
+        const posLoc = gl.getAttribLocation(program, 'a_position');
+        const uvLoc  = gl.getAttribLocation(program, 'a_texCoord');
+
+        gl.bindBuffer(gl.ARRAY_BUFFER, positionBuffer);
+        gl.vertexAttribPointer(posLoc, 2, gl.FLOAT, false, 0, 0);
+        gl.enableVertexAttribArray(posLoc);
+
+        gl.bindBuffer(gl.ARRAY_BUFFER, texCoordBuffer);
+        gl.vertexAttribPointer(uvLoc, 2, gl.FLOAT, false, 0, 0);
+        gl.enableVertexAttribArray(uvLoc);
+
+        // ----- Texture creation & nearest‑neighbor filter ----------------------
+        videoTexture = gl.createTexture();
+        gl.bindTexture(gl.TEXTURE_2D, videoTexture);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+        // Using NEAREST filtering removes seams caused by UV 0.5 boundaries
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+        gl.uniform1i(gl.getUniformLocation(program, 'u_videoTexture'), 0);
+        gl.disable(gl.DEPTH_TEST);
+        return true;
+    }
+
+    /**
+     * Build the full UV‑coordinate list (48 floats) for the four scrambled blocks.
+     * The order of the vertices follows the same order as the NDC positions.
+     */
+    function generateTexCoords() {
+        /* Each source block → 6 vertices (12 floats) */
+        const sourceUVs = [
+            // block 0 – top‑left (0.0 … 0.5)
+            [0,   0,  0.5, 0,   0,   0.5, 0.5, 0,  0.5, 0.5, 0,   0.5],
+            // block 1 – top‑right (0.5 … 1.0)
+            [0.5, 0,   1,   0,   0.5, 0.5, 1,   0,   1,   0.5, 0.5, 0.5],
+            // block 2 – bottom‑left (0.0 … 0.5)
+            [0,   0.5, 0.5, 0.5, 0,   1,   0.5, 0.5, 0.5, 1,   0,   1],
+            // block 3 – bottom‑right (0.5 … 1.0)
+            [0.5, 0.5, 1,   0.5, 0.5, 1,   1,   0.5, 1,   1,   0.5, 1]
+        ];
+        const coords = [];
+
+        for (let dest = 0; dest < 4; ++dest) {
+            const srcIdx = MAPPING[dest];
+            const transform = TRANSFORMS[dest];
+            const block = sourceUVs[srcIdx];
+            const transformed = block.slice();          // copy the original 12 floats
+
+            for (let i = 0; i < transformed.length; i += 2) {
+                let u = transformed[i];
+                let v = transformed[i + 1];
+
+                if (transform === 'mirror') {
+                    const half = (srcIdx % 2 === 0) ? 0.0 : 0.5; // left half → 0, right half → 0.5
+                    transformed[i] = half + (0.5 - (u - half));
+                } else if (transform === 'rotate180') {
+                    const uStart = (srcIdx % 2 === 0) ? 0.0 : 0.5;
+                    const vStart = (srcIdx < 2) ? 0.0 : 0.5;
+                    const newU = uStart + 0.5 - (u - uStart);
+                    const newV = vStart + 0.5 - (v - vStart);
+                    transformed[i]     = newU;
+                    transformed[i + 1] = newV;
+                }
+            }
+            coords.push(...transformed);
+        }
+        return coords;   // 48 numbers = 24 vertices × 2 UVs
+    }
+
+    /* ---------------------- RENDERING LOGIC ---------------------- */
+    function activateScrambler() {
+        // Make sure the canvas is correctly sized before the first frame
+        resizeCanvas();
+
+        canvas.style.display = 'block';
+        video.style.opacity  = '0.001';
+
+        // Preferred sync: requestVideoFrameCallback (pixel‑perfect timing)
+        if (video.requestVideoFrameCallback) {
+            video.requestVideoFrameCallback(renderLoop);
+        } else {
+            // Fallback for browsers that don’t implement it
+            rafId = requestAnimationFrame(rafLoop);
+        }
+    }
+
+    function stopScrambling() {
+        canvas.style.display = 'none';
+        video.style.opacity  = '1';
+
+        // Cancel the fallback animation loop, if we use it
+        if (rafId !== null) {
+            cancelAnimationFrame(rafId);
+            rafId = null;
+        }
+
+        // Clear the GL canvas (helps avoid “invalid operation” errors)
+        if (gl) gl.clear(gl.COLOR_BUFFER_BIT);
+    }
+
+    /* ----------- High‑performance video‑frame sync (preferred) ----------- */
+    function renderLoop(nowOrMeta) {
+        // `nowOrMeta` may be a Timestamp or VideoFrameMetadata depending on the browser.
+        // Both are ignored – we just draw the current frame.
+        drawFrame();
+        // Queue the next callback
+        video.requestVideoFrameCallback(renderLoop);
+    }
+
+    /* ------------------- Fallback requestAnimationFrame loop ----------- */
+    function rafLoop(timestamp) {
+        drawFrame();
+        rafId = requestAnimationFrame(rafLoop);
+    }
+
+    /** Push the current video bitmap into the GL texture and draw the 4 quads. */
+    function drawFrame() {
+        if (!gl || !video) return;
+
+        // Upload the fresh video frame into the bound texture
+        gl.activeTexture(gl.TEXTURE0);
+        gl.bindTexture(gl.TEXTURE_2D, videoTexture);
+        gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA,
+                     gl.RGBA, gl.UNSIGNED_BYTE, video);
+
+        // Clear to transparent (helps when the video is paused)
+        gl.clearColor(0, 0, 0, 0);
+        gl.clear(gl.COLOR_BUFFER_BIT);
+
+        // Draw the 24 vertices (4 quads × 2 triangles)
+        if (gl.getError() !== gl.NO_ERROR) {
+            // If something went wrong, abort the draw to avoid a recursive error loop.
+            return;
+        }
+        gl.drawArrays(gl.TRIANGLES, 0, 24);
+    }
+
+    /* --------------------------- OBSERVERS -------------------------- */
+    function setupObservers(target) {
+        if (!target) return;
+        if (resizeObs) resizeObs.disconnect();
+
+        if (window.ResizeObserver) {
+            resizeObs = new ResizeObserver(() => {
+                if (canvas && canvas.style.display !== 'none') resizeCanvas();
+            });
+            resizeObs.observe(target);
+        } else {
+            window.addEventListener('resize', () => {
+                if (canvas && canvas.style.display !== 'none') resizeCanvas();
+            });
+        }
+    }
+
+    /* ---------------------- NAVIGATION HANDLER --------------------- */
+    function handleYtNavigation() {
+        // YouTube sometimes swaps the video element (e.g. after a “next video” click)
+        clearTimeout(window.ytInitTimer);
+        window.ytInitTimer = setTimeout(() => {
+            cleanup();
+            init();
+        }, 500);
+    }
+    window.addEventListener('yt-page-data-updated', handleYtNavigation);
+
+    /* ------------------------------ BOOT ------------------------------ */
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', init);
+    } else {
+        init();
+    }
+})();
